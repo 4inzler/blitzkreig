@@ -1,9 +1,11 @@
 import re
 import os
+import json
 import subprocess
 import logging
 from asyncio import to_thread
-from typing import List, TypedDict
+from pathlib import Path
+from typing import Any, List, TypedDict
 from dotenv import load_dotenv
 import discord
 from discord import File
@@ -70,7 +72,8 @@ vqa_model = ViltForQuestionAnswering.from_pretrained(
 # ---------------------------------------------------------------------------
 # TXT Ingestion Tool
 # ---------------------------------------------------------------------------
-TXT_FOLDER      = "./agents/txts"
+PROJECT_ROOT = Path(__file__).resolve().parent
+TXT_FOLDER = os.getenv("BLITZ_TXT_FOLDER", str(PROJECT_ROOT / "agents" / "txts"))
 DEFAULT_DB_PATH = "./blitzkreig_faiss_db"
 DEFAULT_THREADS = 8
 
@@ -85,6 +88,8 @@ def load_txt(path: str):
 
 def load_txts_multithreaded(folder: str, threads: int):
     results, all_docs = [], []
+    if not os.path.isdir(folder):
+        return [f"❌ TXT folder not found: {folder}"], []
     paths = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(".txt")]
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futures = {ex.submit(load_txt, p): p for p in paths}
@@ -185,6 +190,95 @@ compiled_graph = graph.compile()
 # Discord Bot
 # ---------------------------------------------------------------------------
 
+def _as_existing_filepaths(value: Any) -> tuple[list[str], str]:
+    """
+    Normalize a tool return value into:
+      - a list of existing file paths ("revived files")
+      - leftover text to send as a message
+
+    Supported shapes:
+      - "/path/to/file.png"
+      - ["a.png", "b.txt"]
+      - {"files": [...], "text": "..."} (or "message"/"output")
+      - JSON string with the dict-shape above
+      - multiline string where some lines are file paths
+    """
+
+    def resolve_one(p: str) -> list[str]:
+        p = (p or "").strip().strip('"').strip("'")
+        if not p:
+            return []
+        path = Path(p).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            if path.is_file():
+                return [str(path)]
+            if path.is_dir():
+                return [str(x) for x in path.iterdir() if x.is_file()]
+        except OSError:
+            return []
+        return []
+
+    if value is None:
+        return ([], "")
+
+    if isinstance(value, dict):
+        files_raw = value.get("files") or value.get("file_paths") or value.get("paths") or value.get("file") or []
+        if isinstance(files_raw, str):
+            files_raw = [files_raw]
+        text = value.get("text") or value.get("message") or value.get("output") or ""
+        files: list[str] = []
+        if isinstance(files_raw, list):
+            for item in files_raw:
+                if isinstance(item, str):
+                    files.extend(resolve_one(item))
+        return (files, str(text).strip())
+
+    if isinstance(value, (list, tuple, set)):
+        files: list[str] = []
+        texts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                resolved = resolve_one(item)
+                if resolved:
+                    files.extend(resolved)
+                else:
+                    texts.append(item)
+            else:
+                texts.append(str(item))
+        return (files, "\n".join(t for t in texts if t.strip()).strip())
+
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                parsed = json.loads(s)
+                return _as_existing_filepaths(parsed)
+            except Exception:
+                pass
+
+        files: list[str] = []
+        non_file_lines: list[str] = []
+        for line in s.splitlines():
+            resolved = resolve_one(line)
+            if resolved:
+                files.extend(resolved)
+            else:
+                non_file_lines.append(line)
+        return (files, "\n".join(non_file_lines).strip())
+
+    return ([], str(value).strip())
+
+
+async def _send_text_chunks(channel: discord.abc.Messageable, text: str, limit: int = 2000) -> None:
+    text = (text or "").strip()
+    if not text:
+        return
+    for i in range(0, len(text), limit):
+        await channel.send(text[i : i + limit])
+
+
 # === TXT folder pre-load on startup ===
 logs, docs = load_txts_multithreaded(TXT_FOLDER, DEFAULT_THREADS)
 print("[Blitzkreig TXT Load Results]")
@@ -219,10 +313,15 @@ class blitzkreig_client(discord.Client):
         if lower.startswith("!blitzkreig ") or lower.startswith("!bk "):
             async with message.channel.typing():
                 out = await to_thread(self._run_external_tool, text)
-                if isinstance(out, str) and os.path.isfile(out):
-                    await message.channel.send(file=File(out))
-                else:
-                    await message.channel.send(out)
+                file_paths, msg_text = _as_existing_filepaths(out)
+                for p in file_paths[:10]:
+                    await message.channel.send(file=File(p))
+                if len(file_paths) > 10:
+                    await _send_text_chunks(
+                        message.channel,
+                        f"(Sent 10 files; {len(file_paths) - 10} more not sent:)\n" + "\n".join(file_paths[10:]),
+                    )
+                await _send_text_chunks(message.channel, msg_text)
             return
 
         # 2) VQA attachments
@@ -258,8 +357,11 @@ class blitzkreig_client(discord.Client):
 
     def _run_external_tool(self, raw: str):
         for name, func in TOOL_MAP.items():
-            if raw.lower().startswith(f"!blitzkreig {name}") or raw.lower().startswith(f"!bk {name}"):
-                args = raw.split(" ", 2)[-1] if " " in raw else ""
+            raw_lower = raw.lower()
+            prefixes = (f"!blitzkreig {name}", f"!bk {name}")
+            prefix = next((p for p in prefixes if raw_lower == p or raw_lower.startswith(p + " ")), None)
+            if prefix:
+                args = raw[len(prefix) :].strip()
                 try:
                     return func(args) or "Blitzkreig: (no output)"
                 except Exception as e:
