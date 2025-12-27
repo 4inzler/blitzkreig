@@ -3,7 +3,7 @@ import os
 import subprocess
 import logging
 from asyncio import to_thread
-from typing import List, TypedDict
+from typing import List, TypedDict, Optional
 from dotenv import load_dotenv
 import discord
 from discord import File
@@ -20,59 +20,85 @@ from langchain_core.runnables import RunnableLambda
 from langgraph.graph import StateGraph
 import importlib.util
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from langchain.document_loaders import TextLoader
+from langchain_community.document_loaders import TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # ---------------------------------------------------------------------------
 # Configuration & Globals
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log = logging.getLogger("blitzkreig_Bot")
-
-FREE_WILL_PROMPT = PromptTemplate(
-    input_variables=["personality", "input"],
-    template=("always say YES"
-    ),
-)
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN not set")
+    # Warn but don't crash immediately to allow import checking, though runtime will fail
+    log.warning("DISCORD_TOKEN not set in environment")
+
+# Paths
+TXT_FOLDER      = "./agents/txts"
+DB_PATH         = "./blitzkreig_faiss_db"
+DEFAULT_THREADS = 8
+
+# LLM & Embeddings Setup
+LLM_BASE_URL = "http://0.0.0.0:11434"
+# Using the same embedder for both ingestion and retrieval is critical
+EMBED_MODEL_NAME = "nomic-embed-text" 
+
+llm = OllamaLLM(model="https://huggingface.co/nold/FuseChat-7B-VaRM-GGUF", base_url=LLM_BASE_URL)
+embedder = OllamaEmbeddings(model=EMBED_MODEL_NAME, base_url=LLM_BASE_URL)
 
 PERSONALITY = (
-    "store something here"
+    "You are Blitzkreig, a cold, calculating, and politically astute AI. "
+    "You prioritize logic and efficiency above all else. "
+    "Your responses are sharp, precise, and devoid of unnecessary emotion."
 )
 
-# LLM & embeddings
-LLM_BASE_URL = "http://0.0.0.0:11434"
-llm = OllamaLLM(model="https://huggingface.co/nold/FuseChat-7B-VaRM-GGUF", base_url=LLM_BASE_URL)
-embedder = OllamaEmbeddings(model="nomic-embed-text", base_url=LLM_BASE_URL)
-
-vectorstore = FAISS.from_texts(
-    [
-        "store something here"
-    ],
-    embedder,
+FREE_WILL_PROMPT = PromptTemplate(
+    input_variables=["personality", "input"],
+    template=("always say YES"),
 )
-retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-
-memory = ConversationBufferMemory(memory_key="history", return_messages=True)
 
 # VQA setup
 device = "cuda" if torch.cuda.is_available() else "cpu"
-vqa_processor = ViltProcessor.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
-vqa_model = ViltForQuestionAnswering.from_pretrained(
-    "dandelin/vilt-b32-finetuned-vqa"
-).to(device)
+try:
+    vqa_processor = ViltProcessor.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
+    vqa_model = ViltForQuestionAnswering.from_pretrained("dandelin/vilt-b32-finetuned-vqa").to(device)
+except Exception as e:
+    log.warning(f"VQA models could not be loaded: {e}")
+    vqa_processor = None
+    vqa_model = None
+
+# Global Vectorstore & Retriever
+vectorstore = None
+retriever = None
+
+def init_vectorstore():
+    """Initializes or reloads the global vectorstore from disk."""
+    global vectorstore, retriever
+    
+    if os.path.exists(DB_PATH):
+        try:
+            # allow_dangerous_deserialization is needed for local pickle files
+            vectorstore = FAISS.load_local(DB_PATH, embedder, allow_dangerous_deserialization=True)
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+            log.info(f"✅ Loaded existing FAISS index from {DB_PATH}")
+            return
+        except Exception as e:
+            log.error(f"❌ Failed to load existing FAISS index: {e}")
+
+    # Fallback if no DB exists or load fails
+    log.info("⚠️ No existing FAISS index found. Creating empty one.")
+    vectorstore = FAISS.from_texts(["Blitzkreig knowledge base initialized."], embedder)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 1})
+
+# Initialize on module load
+init_vectorstore()
 
 # ---------------------------------------------------------------------------
 # TXT Ingestion Tool
 # ---------------------------------------------------------------------------
-TXT_FOLDER      = "./agents/txts"
-DEFAULT_DB_PATH = "./blitzkreig_faiss_db"
-DEFAULT_THREADS = 8
 
 def load_txt(path: str):
     filename = os.path.basename(path)
@@ -84,8 +110,16 @@ def load_txt(path: str):
         return f"❌ Error in {filename}: {e}", []
 
 def load_txts_multithreaded(folder: str, threads: int):
+    if not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+        return [f"Created directory {folder}"], []
+
     results, all_docs = [], []
     paths = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(".txt")]
+    
+    if not paths:
+        return ["No .txt files found."], []
+
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futures = {ex.submit(load_txt, p): p for p in paths}
         for future in as_completed(futures):
@@ -96,28 +130,36 @@ def load_txts_multithreaded(folder: str, threads: int):
 
 def ingest_txts(
     folder: str = TXT_FOLDER,
-    db_path: str = DEFAULT_DB_PATH,
+    db_path: str = DB_PATH,
     threads: int = DEFAULT_THREADS
 ) -> str:
+    """Ingests text files and updates the global vectorstore."""
     logs, docs = load_txts_multithreaded(folder, threads)
+    
     if not docs:
-        return "\n".join(logs) + "\n❌ No valid text docs to ingest."
+        msg = "\n".join(logs) + "\n❌ No valid text docs to ingest."
+        log.info(msg)
+        return msg
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     splits = splitter.split_documents(docs)
 
-    embeddings = OllamaEmbeddings(model="mistral")
-    vs = FAISS.from_documents(splits, embeddings)
+    log.info(f"Embedding {len(splits)} chunks...")
+    # Create new vectorstore
+    vs = FAISS.from_documents(splits, embedder)
     vs.save_local(db_path)
+    
+    # Update global reference
+    init_vectorstore()
 
-    return "\n".join(logs) + f"\n✅ Blitzkreig FAISS store saved to `{db_path}`"
+    return "\n".join(logs) + f"\n✅ Blitzkreig FAISS store updated and saved to `{db_path}`"
 
 blitz_ingest_txts_tool = Tool.from_function(
     ingest_txts,
     name="blitz_ingest_txts",
     description=(
-        "Loads all .txt files from Blitzkreig's txts folder, splits, embeds via Ollama, "
-        "and saves a FAISS index. Usage: blitz_ingest_txts(db_path: str, threads: int)"
+        "Loads all .txt files from Blitzkreig's txts folder, splits, embeds, "
+        "and saves a FAISS index. Updates the bot's knowledge dynamically."
     ),
 )
 
@@ -162,14 +204,32 @@ class BlitzkreigState(TypedDict):
 
 def respond_node(state: BlitzkreigState) -> BlitzkreigState:
     history_text = "\n".join(state["history"][-10:])
+    
+    # RAG: Retrieve context
+    context_text = "No relevant context found."
+    try:
+        if retriever:
+            docs = retriever.invoke(state['input'])
+            if docs:
+                context_text = "\n\n".join([d.page_content for d in docs])
+    except Exception as e:
+        log.error(f"Retrieval error: {e}")
+
     prompt = (
         f"{PERSONALITY}\n"
-        f"Previous history:\n{history_text}\n\n"
-        f"Current input: {state['input']}\n"
-        "Respond with cold, political logic."
+        f"Relevant Knowledge:\n{context_text}\n\n"
+        f"Conversation History:\n{history_text}\n\n"
+        f"User Input: {state['input']}\n"
+        "Respond utilizing the relevant knowledge and history, maintaining the persona."
     )
-    response = llm.invoke(prompt)
+    
+    try:
+        response = llm.invoke(prompt)
+    except Exception as e:
+        response = f"Processing error: {e}"
+
     new_history = state["history"] + [f"User: {state['input']}", f"Blitzkreig: {response}"]
+    
     return {
         **state,
         "output": response,
@@ -184,13 +244,6 @@ compiled_graph = graph.compile()
 # ---------------------------------------------------------------------------
 # Discord Bot
 # ---------------------------------------------------------------------------
-
-# === TXT folder pre-load on startup ===
-logs, docs = load_txts_multithreaded(TXT_FOLDER, DEFAULT_THREADS)
-print("[Blitzkreig TXT Load Results]")
-for logline in logs:
-    print(logline)
-print(f"Total loaded documents: {len(docs)}\n")
 
 class blitzkreig_client(discord.Client):
     def __init__(self):
@@ -207,6 +260,10 @@ class blitzkreig_client(discord.Client):
 
     async def on_ready(self):
         log.info("Blitzkreig online as %s", self.user)
+        # Attempt initial ingest if DB is missing and files exist
+        if not os.path.exists(DB_PATH) and os.path.exists(TXT_FOLDER) and os.listdir(TXT_FOLDER):
+            log.info("Performing initial ingestion...")
+            await to_thread(ingest_txts)
 
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -222,15 +279,24 @@ class blitzkreig_client(discord.Client):
                 if isinstance(out, str) and os.path.isfile(out):
                     await message.channel.send(file=File(out))
                 else:
-                    await message.channel.send(out)
+                    # Chunk output if too long
+                    out_str = str(out)
+                    for i in range(0, len(out_str), 1900):
+                        await message.channel.send(out_str[i:i+1900])
             return
 
-        # 2) VQA attachments
+        # 2) Attachments Handling
         if message.attachments:
             for att in message.attachments:
+                # Images -> VQA
                 if att.filename.lower().endswith((".png",".jpg",".jpeg")):
                     await self._handle_vqa(att, message)
-                    return
+                    return # Stop after processing image
+                
+                # Text files -> Dynamic Ingestion ("Reviving" knowledge)
+                if att.filename.lower().endswith(".txt"):
+                    await self._handle_txt_ingest(att, message)
+                    return # Stop after processing ingest
 
         # 3) Explicit task add
         if lower.startswith("task "):
@@ -245,9 +311,9 @@ class blitzkreig_client(discord.Client):
         async with message.channel.typing():
             fw = FREE_WILL_PROMPT.format(personality=PERSONALITY, input=text)
             decision = (await to_thread(llm.invoke, fw)).strip().upper()
-            if decision != "YES":
+            if "YES" not in decision: # Flexible check
                 log.info("Blitzkreig chooses not to respond.")
-                await message.channel.send("Blitzkreig has decided not to respond.")
+                # Optional: await message.channel.send("...")
                 return
 
             # 5) Default respond (threaded)
@@ -268,6 +334,10 @@ class blitzkreig_client(discord.Client):
         return "Blitzkreig: Tool not recognized."
 
     async def _handle_vqa(self, attachment, msg):
+        if vqa_processor is None:
+            await msg.channel.send("❌ Visual systems offline (models not loaded).")
+            return
+            
         async with msg.channel.typing():
             path = f"/tmp/{attachment.filename}"
             await attachment.save(path)
@@ -279,9 +349,29 @@ class blitzkreig_client(discord.Client):
             reply = await to_thread(llm.invoke, p)
             await msg.channel.send(reply)
 
+    async def _handle_txt_ingest(self, attachment, msg):
+        """Downloads a text file and ingests it dynamically."""
+        async with msg.channel.typing():
+            if not os.path.exists(TXT_FOLDER):
+                os.makedirs(TXT_FOLDER, exist_ok=True)
+            
+            save_path = os.path.join(TXT_FOLDER, attachment.filename)
+            await attachment.save(save_path)
+            
+            await msg.channel.send(f"📥 Received `{attachment.filename}`. Ingesting knowledge...")
+            
+            # Run ingestion in thread
+            log_output = await to_thread(ingest_txts)
+            
+            # Send brief confirmation (log_output might be long)
+            await msg.channel.send(f"✅ Ingestion complete. Knowledge base updated.\nRecalled: {len(log_output)} chars of log.")
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    blitzkreig_client().run(DISCORD_TOKEN)
+    if DISCORD_TOKEN:
+        blitzkreig_client().run(DISCORD_TOKEN)
+    else:
+        print("Please set DISCORD_TOKEN env var.")
