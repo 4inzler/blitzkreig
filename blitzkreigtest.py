@@ -9,6 +9,8 @@ import tempfile
 import shutil
 from asyncio import to_thread
 from typing import List, TypedDict
+from pathlib import Path
+from typing import Any
 
 # === Third‑Party ===
 from dotenv import load_dotenv
@@ -52,7 +54,8 @@ llm = OllamaLLM(model="https://huggingface.co/nold/FuseChat-7B-VaRM-GGUF", base_
 
 # --- Vectorstore ingestion from TXT folder ---
 
-TXT_FOLDER = "/home/kboshi/Documents/coding/blitzkreig/agents/txts"  # your .txt files here
+PROJECT_ROOT = Path(__file__).resolve().parent
+TXT_FOLDER = os.getenv("BLITZ_TXT_FOLDER", str(PROJECT_ROOT / "agents" / "txts"))
 VECTOR_STORE_PATH = "faiss_index"
 
 def build_vector_store_from_txt_folder(
@@ -63,6 +66,12 @@ def build_vector_store_from_txt_folder(
     chunk_overlap: int = 100,
     vector_store_path: str = VECTOR_STORE_PATH
 ) -> FAISS:
+    embedder = OllamaEmbeddings(model=embedding_model_name, base_url=base_url)
+
+    if not os.path.isdir(folder_path):
+        log.warning("TXT folder not found: %s (using empty vectorstore)", folder_path)
+        return FAISS.from_texts([""], embedder)
+
     txt_files = glob.glob(os.path.join(folder_path, "*.txt"))
     documents = []
     for file_path in txt_files:
@@ -71,17 +80,15 @@ def build_vector_store_from_txt_folder(
     
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     split_docs = splitter.split_documents(documents)
-    
-    embedder = OllamaEmbeddings(model=embedding_model_name, base_url=base_url)
-    
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        vectorstore = FAISS.from_documents(split_docs, embedder)
-        vectorstore.save_local(tmp_dir)
-        
-        if os.path.exists(vector_store_path):
-            shutil.rmtree(vector_store_path)
-        shutil.move(tmp_dir, vector_store_path)
-    
+
+    if not split_docs:
+        log.warning("No .txt documents found in %s (using empty vectorstore)", folder_path)
+        return FAISS.from_texts([""], embedder)
+
+    vectorstore = FAISS.from_documents(split_docs, embedder)
+    if os.path.exists(vector_store_path):
+        shutil.rmtree(vector_store_path)
+    vectorstore.save_local(vector_store_path)
     return FAISS.load_local(vector_store_path, embedder, allow_dangerous_deserialization=True)
 
 vectorstore = build_vector_store_from_txt_folder(TXT_FOLDER)
@@ -211,6 +218,95 @@ compiled_graph = graph.compile()
 #  Discord Bot
 # ---------------------------------------------------------------------------
 
+def _as_existing_filepaths(value: Any) -> tuple[list[str], str]:
+    """
+    Normalize a tool return value into:
+      - a list of existing file paths ("revived files")
+      - leftover text to send as a message
+
+    Supported shapes:
+      - "/path/to/file.png"
+      - ["a.png", "b.txt"]
+      - {"files": [...], "text": "..."} (or "message"/"output")
+      - JSON string with the dict-shape above
+      - multiline string where some lines are file paths
+    """
+
+    def resolve_one(p: str) -> list[str]:
+        p = (p or "").strip().strip('"').strip("'")
+        if not p:
+            return []
+        path = Path(p).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            if path.is_file():
+                return [str(path)]
+            if path.is_dir():
+                return [str(x) for x in path.iterdir() if x.is_file()]
+        except OSError:
+            return []
+        return []
+
+    if value is None:
+        return ([], "")
+
+    if isinstance(value, dict):
+        files_raw = value.get("files") or value.get("file_paths") or value.get("paths") or value.get("file") or []
+        if isinstance(files_raw, str):
+            files_raw = [files_raw]
+        text = value.get("text") or value.get("message") or value.get("output") or ""
+        files: list[str] = []
+        if isinstance(files_raw, list):
+            for item in files_raw:
+                if isinstance(item, str):
+                    files.extend(resolve_one(item))
+        return (files, str(text).strip())
+
+    if isinstance(value, (list, tuple, set)):
+        files: list[str] = []
+        texts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                resolved = resolve_one(item)
+                if resolved:
+                    files.extend(resolved)
+                else:
+                    texts.append(item)
+            else:
+                texts.append(str(item))
+        return (files, "\n".join(t for t in texts if t.strip()).strip())
+
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                parsed = json.loads(s)
+                return _as_existing_filepaths(parsed)
+            except Exception:
+                pass
+
+        files: list[str] = []
+        non_file_lines: list[str] = []
+        for line in s.splitlines():
+            resolved = resolve_one(line)
+            if resolved:
+                files.extend(resolved)
+            else:
+                non_file_lines.append(line)
+        return (files, "\n".join(non_file_lines).strip())
+
+    return ([], str(value).strip())
+
+
+async def _send_text_chunks(channel: discord.abc.Messageable, text: str, limit: int = 2000) -> None:
+    text = (text or "").strip()
+    if not text:
+        return
+    for i in range(0, len(text), limit):
+        await channel.send(text[i : i + limit])
+
+
 class AMClient(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -235,12 +331,15 @@ class AMClient(discord.Client):
 
         if lowered.startswith("!blitzkreig "):
             res = await to_thread(self._run_external_tool, text)
-            if isinstance(res, str) and os.path.isfile(res):
-                await message.channel.send(file=File(res))
-            else:
-                # Split response into chunks <= 2000 chars
-                for i in range(0, len(res), 2000):
-                    await message.channel.send(res[i:i+2000])
+            file_paths, msg_text = _as_existing_filepaths(res)
+            for p in file_paths[:10]:
+                await message.channel.send(file=File(p))
+            if len(file_paths) > 10:
+                await _send_text_chunks(
+                    message.channel,
+                    f"(Sent 10 files; {len(file_paths) - 10} more not sent:)\n" + "\n".join(file_paths[10:]),
+                )
+            await _send_text_chunks(message.channel, msg_text)
             return
 
         if message.attachments:
@@ -258,9 +357,11 @@ class AMClient(discord.Client):
 
     def _run_external_tool(self, raw: str) -> str:
         for name, func in TOOL_MAP.items():
-            if raw.lower().startswith(f"!blitzkreig {name}"):
+            raw_lower = raw.lower()
+            prefix = f"!blitzkreig {name}"
+            if raw_lower == prefix or raw_lower.startswith(prefix + " "):
                 try:
-                    args = raw[len(f"!blitzkreig {name}"):].strip()
+                    args = raw[len(prefix):].strip()
                     result = func(args)
                     return result or "blitzkreig: The tool returned no output."
                 except Exception as exc:
