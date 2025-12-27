@@ -2,8 +2,9 @@ import re
 import os
 import subprocess
 import logging
+from datetime import datetime
 from asyncio import to_thread
-from typing import List, TypedDict
+from typing import List, TypedDict, Dict, Any
 from dotenv import load_dotenv
 import discord
 from discord import File
@@ -68,49 +69,107 @@ vqa_model = ViltForQuestionAnswering.from_pretrained(
 ).to(device)
 
 # ---------------------------------------------------------------------------
-# TXT Ingestion Tool
+# TXT Ingestion Tool - Dynamic File Discovery & Loading
 # ---------------------------------------------------------------------------
-TXT_FOLDER      = "./agents/txts"
-DEFAULT_DB_PATH = "./blitzkreig_faiss_db"
-DEFAULT_THREADS = 8
+TXT_FOLDER      = os.getenv("BLITZKRIEG_TXT_FOLDER", "./agents/txts")
+DEFAULT_DB_PATH = os.getenv("BLITZKRIEG_DB_PATH", "./blitzkreig_faiss_db")
+DEFAULT_THREADS = int(os.getenv("BLITZKRIEG_THREADS", "8"))
+
+# Track loaded files metadata
+loaded_files_metadata = []
 
 def load_txt(path: str):
     filename = os.path.basename(path)
     try:
         loader = TextLoader(path, encoding="utf-8")
         docs = loader.load()
-        return (f"✅ Loaded: {filename}", docs) if docs else (f"⚠️ Skipped {filename}: empty", [])
+        if docs:
+            file_size = os.path.getsize(path)
+            mod_time = os.path.getmtime(path)
+            char_count = sum(len(doc.page_content) for doc in docs)
+            metadata = {
+                "filename": filename,
+                "path": path,
+                "size": file_size,
+                "modified": mod_time,
+                "char_count": char_count,
+                "doc_count": len(docs)
+            }
+            loaded_files_metadata.append(metadata)
+            return (f"✅ Loaded: {filename} ({file_size} bytes, {char_count} chars, {len(docs)} docs)", docs)
+        else:
+            return (f"⚠️ Skipped {filename}: empty", [])
     except Exception as e:
         return f"❌ Error in {filename}: {e}", []
 
 def load_txts_multithreaded(folder: str, threads: int):
     results, all_docs = [], []
+    loaded_files_metadata.clear()  # Reset metadata on each load
+    
+    if not os.path.exists(folder):
+        log.warning(f"TXT folder does not exist: {folder}")
+        return [f"❌ Folder not found: {folder}"], []
+    
     paths = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(".txt")]
+    
+    if not paths:
+        return [f"⚠️ No .txt files found in {folder}"], []
+    
+    log.info(f"Discovering {len(paths)} .txt files in {folder}...")
+    
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futures = {ex.submit(load_txt, p): p for p in paths}
         for future in as_completed(futures):
             log_msg, docs = future.result()
             results.append(log_msg)
             all_docs.extend(docs)
+    
     return results, all_docs
+
+def get_loaded_files_summary() -> str:
+    if not loaded_files_metadata:
+        return "No files currently loaded."
+    
+    summary = [
+        f"📚 **Blitzkrieg Knowledge Base Summary**",
+        f"Total files: {len(loaded_files_metadata)}",
+        f"Total documents: {sum(m['doc_count'] for m in loaded_files_metadata)}",
+        f"Total characters: {sum(m['char_count'] for m in loaded_files_metadata):,}",
+        f"Total size: {sum(m['size'] for m in loaded_files_metadata):,} bytes",
+        "",
+        "**Loaded Files:**"
+    ]
+    
+    for meta in sorted(loaded_files_metadata, key=lambda x: x['filename']):
+        mod_date = datetime.fromtimestamp(meta['modified']).strftime('%Y-%m-%d %H:%M:%S')
+        summary.append(
+            f"  • {meta['filename']}: {meta['char_count']:,} chars, {meta['doc_count']} docs (modified: {mod_date})"
+        )
+    
+    return "\n".join(summary)
 
 def ingest_txts(
     folder: str = TXT_FOLDER,
     db_path: str = DEFAULT_DB_PATH,
     threads: int = DEFAULT_THREADS
 ) -> str:
+    log.info(f"🔄 Starting TXT ingestion from: {folder}")
     logs, docs = load_txts_multithreaded(folder, threads)
     if not docs:
         return "\n".join(logs) + "\n❌ No valid text docs to ingest."
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     splits = splitter.split_documents(docs)
+    log.info(f"✂️ Split {len(docs)} documents into {len(splits)} chunks")
 
-    embeddings = OllamaEmbeddings(model="mistral")
+    embeddings = OllamaEmbeddings(model="mistral", base_url=LLM_BASE_URL)
+    log.info(f"🧠 Creating embeddings and building FAISS index...")
     vs = FAISS.from_documents(splits, embeddings)
     vs.save_local(db_path)
+    log.info(f"💾 Saved FAISS index to: {db_path}")
 
-    return "\n".join(logs) + f"\n✅ Blitzkreig FAISS store saved to `{db_path}`"
+    summary = get_loaded_files_summary()
+    return "\n".join(logs) + f"\n\n✅ Blitzkreig FAISS store saved to `{db_path}`\n\n{summary}"
 
 blitz_ingest_txts_tool = Tool.from_function(
     ingest_txts,
@@ -121,13 +180,34 @@ blitz_ingest_txts_tool = Tool.from_function(
     ),
 )
 
+blitz_show_files_tool = Tool.from_function(
+    get_loaded_files_summary,
+    name="blitz_show_files",
+    description=(
+        "Shows a summary of all currently loaded .txt files including file names, "
+        "character counts, and document counts. Usage: blitz_show_files()"
+    ),
+)
+
+blitz_reload_tool = Tool.from_function(
+    lambda: ingest_txts(TXT_FOLDER, DEFAULT_DB_PATH, DEFAULT_THREADS),
+    name="blitz_reload",
+    description=(
+        "Reloads all .txt files from the configured folder and rebuilds the FAISS index. "
+        "Usage: blitz_reload()"
+    ),
+)
+
 # ---------------------------------------------------------------------------
 # Load external agents + inject TXT tool
 # ---------------------------------------------------------------------------
 def load_external_tools(folder: str = "agents") -> List[Tool]:
     tools: List[Tool] = []
     if not os.path.isdir(folder):
+        log.warning(f"Agent folder not found: {folder}")
         return tools
+    
+    log.info(f"🔍 Scanning for external tools in: {folder}")
     for fname in os.listdir(folder):
         if not fname.endswith(".py") or fname.startswith("__"):
             continue
@@ -139,11 +219,14 @@ def load_external_tools(folder: str = "agents") -> List[Tool]:
                 spec.loader.exec_module(mod)  # type: ignore
                 if hasattr(mod, "tool") and isinstance(mod.tool, Tool):
                     tools.append(mod.tool)
-                    log.info("Loaded external tool: %s", mod.tool.name)
+                    log.info(f"✅ Loaded external tool: {mod.tool.name}")
         except Exception as exc:
-            log.warning("Failed to load %s: %s", fname, exc)
-    tools.append(blitz_ingest_txts_tool)
-    log.info("Injected TXT ingestion tool: %s", blitz_ingest_txts_tool.name)
+            log.warning(f"⚠️ Failed to load {fname}: {exc}")
+    
+    # Inject built-in Blitzkrieg tools
+    tools.extend([blitz_ingest_txts_tool, blitz_show_files_tool, blitz_reload_tool])
+    log.info(f"✅ Injected {len([blitz_ingest_txts_tool, blitz_show_files_tool, blitz_reload_tool])} Blitzkrieg built-in tools")
+    log.info(f"📦 Total tools available: {len(tools)}")
     return tools
 
 external_tools = load_external_tools()
@@ -186,11 +269,22 @@ compiled_graph = graph.compile()
 # ---------------------------------------------------------------------------
 
 # === TXT folder pre-load on startup ===
+log.info(f"🚀 Blitzkrieg Bot Starting Up...")
+log.info(f"📂 TXT Folder: {TXT_FOLDER}")
+log.info(f"💾 Database Path: {DEFAULT_DB_PATH}")
+log.info(f"🧵 Thread Count: {DEFAULT_THREADS}")
+
 logs, docs = load_txts_multithreaded(TXT_FOLDER, DEFAULT_THREADS)
-print("[Blitzkreig TXT Load Results]")
+print("\n" + "="*70)
+print("[📚 Blitzkreig Knowledge Base Loading Results]")
+print("="*70)
 for logline in logs:
     print(logline)
-print(f"Total loaded documents: {len(docs)}\n")
+print(f"\n📊 Total loaded documents: {len(docs)}")
+if loaded_files_metadata:
+    print(f"📁 Files loaded: {len(loaded_files_metadata)}")
+    print(f"📝 Total characters: {sum(m['char_count'] for m in loaded_files_metadata):,}")
+print("="*70 + "\n")
 
 class blitzkreig_client(discord.Client):
     def __init__(self):
@@ -215,24 +309,54 @@ class blitzkreig_client(discord.Client):
         text = message.content.strip()
         lower = text.lower()
 
-        # 1) External tool commands
+        # 1) Built-in info commands
+        if lower in ["!blitzkreig files", "!bk files"]:
+            async with message.channel.typing():
+                summary = get_loaded_files_summary()
+                await message.channel.send(summary)
+            return
+        
+        if lower in ["!blitzkreig reload", "!bk reload"]:
+            async with message.channel.typing():
+                result = await to_thread(ingest_txts, TXT_FOLDER, DEFAULT_DB_PATH, DEFAULT_THREADS)
+                # Split long messages for Discord
+                for i in range(0, len(result), 2000):
+                    await message.channel.send(result[i:i+2000])
+            return
+        
+        if lower in ["!blitzkreig help", "!bk help"]:
+            help_text = (
+                "**🔧 Blitzkrieg Bot Commands**\n"
+                "• `!blitzkreig files` or `!bk files` - Show loaded knowledge base files\n"
+                "• `!blitzkreig reload` or `!bk reload` - Reload all .txt files and rebuild index\n"
+                "• `!blitzkreig help` or `!bk help` - Show this help message\n"
+                f"• `!blitzkreig <tool_name>` - Run external tool (Available: {', '.join(TOOL_MAP.keys())})\n"
+                "• Send an image - Visual Question Answering\n"
+                "• Normal message - Chat with Blitzkrieg\n"
+            )
+            await message.channel.send(help_text)
+            return
+
+        # 2) External tool commands
         if lower.startswith("!blitzkreig ") or lower.startswith("!bk "):
             async with message.channel.typing():
                 out = await to_thread(self._run_external_tool, text)
                 if isinstance(out, str) and os.path.isfile(out):
                     await message.channel.send(file=File(out))
                 else:
-                    await message.channel.send(out)
+                    # Split long messages for Discord
+                    for i in range(0, len(out), 2000):
+                        await message.channel.send(out[i:i+2000])
             return
 
-        # 2) VQA attachments
+        # 3) VQA attachments
         if message.attachments:
             for att in message.attachments:
                 if att.filename.lower().endswith((".png",".jpg",".jpeg")):
                     await self._handle_vqa(att, message)
                     return
 
-        # 3) Explicit task add
+        # 4) Explicit task add
         if lower.startswith("task "):
             async with message.channel.typing():
                 self.state["input"] = text
@@ -241,7 +365,7 @@ class blitzkreig_client(discord.Client):
                 await message.channel.send(new_state["output"])
             return
 
-        # 4) Free Will Decision via LLM (threaded)
+        # 5) Free Will Decision via LLM (threaded)
         async with message.channel.typing():
             fw = FREE_WILL_PROMPT.format(personality=PERSONALITY, input=text)
             decision = (await to_thread(llm.invoke, fw)).strip().upper()
@@ -250,11 +374,14 @@ class blitzkreig_client(discord.Client):
                 await message.channel.send("Blitzkreig has decided not to respond.")
                 return
 
-            # 5) Default respond (threaded)
+            # 6) Default respond (threaded)
             self.state["input"] = text
             new_state = await to_thread(compiled_graph.invoke, self.state)
             self.state = new_state
-            await message.channel.send(new_state["output"])
+            # Split long messages for Discord
+            response = new_state["output"]
+            for i in range(0, len(response), 2000):
+                await message.channel.send(response[i:i+2000])
 
     def _run_external_tool(self, raw: str):
         for name, func in TOOL_MAP.items():
